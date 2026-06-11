@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import winrm
+from winrm.exceptions import InvalidCredentialsError
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,14 @@ def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
         text[:limit]
         + f"\n\n--- truncated ({len(text):,} chars total, showing first {limit:,}) ---"
     )
+
+
+def _is_auth_failure(exc: Exception) -> bool:
+    """True when a connect error is a rejected-credentials failure, so the
+    cached password can be invalidated and re-prompted on the next connect."""
+    if isinstance(exc, InvalidCredentialsError):
+        return True
+    return "credentials were rejected" in str(exc).lower()
 
 
 def _strip_clixml(stderr: str) -> str:
@@ -173,7 +182,10 @@ class SessionManager:
                 "port": str(port),
                 "error": str(e)[:300],
             })
-            return {"error": str(e), "host": host, "port": port}
+            result: dict[str, Any] = {"error": str(e), "host": host, "port": port}
+            if _is_auth_failure(e):
+                result["auth_failed"] = True
+            return result
 
     def disconnect(self, session_id: str) -> dict[str, Any]:
         with self._lock:
@@ -363,6 +375,19 @@ class SessionRegistry:
         if old_mgr is not None:
             old_mgr.disconnect_all()
 
+    def invalidate_password(self) -> None:
+        """Drop the cached password and its manager so the next connect
+        re-prompts. Called when a connect fails with rejected credentials."""
+        username = self.current_username()
+        old_mgr: SessionManager | None = None
+
+        with self._lock:
+            self._passwords.pop(username, None)
+            old_mgr = self._managers.pop(username, None)
+
+        if old_mgr is not None:
+            old_mgr.disconnect_all()
+
     def _get(self) -> SessionManager:
         user = current_user.get()
         if not user:
@@ -408,7 +433,10 @@ class SessionRegistry:
     # ---- delegate every public method ----
 
     def connect(self, host: str, port: int | None = None) -> dict[str, Any]:
-        return self._get().connect(host, port)
+        result = self._get().connect(host, port)
+        if result.get("auth_failed"):
+            self.invalidate_password()
+        return result
 
     def disconnect(self, session_id: str) -> dict[str, Any]:
         return self._get().disconnect(session_id)
