@@ -2,9 +2,10 @@
 
 import base64
 import logging
-from typing import Any
+from typing import Annotated, Any
 
 from fastmcp import Context, FastMCP
+from pydantic import Field
 
 from agent.session_manager import SessionRegistry
 
@@ -58,12 +59,12 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
     # ==================================================================
 
     @mcp.tool()
-    async def connect(host: str, ctx: Context, port: int = 5985) -> dict[str, Any]:
-        """REQUIRED FIRST STEP — connect before calling any other tool. Authenticates via WinRM/NTLM after eliciting your AD password once per cached session; the password is stored only in server memory with an idle TTL and never appears in tool responses or logs. Returns a session_id you must pass to every subsequent tool call, plus computer name, OS version, and last boot time for immediate triage context.
-
-        Args:
-            host: Hostname or IP address (e.g. 'web-server-01').
-            port: WinRM HTTP port (default 5985).
+    async def connect(
+        host: Annotated[str, Field(description="Windows hostname or IP to connect to, e.g. 'web-server-01'")],
+        ctx: Context,
+        port: Annotated[int, Field(description="WinRM HTTP port, default 5985")] = 5985,
+    ) -> dict[str, Any]:
+        """Open a WinRM session to a Windows host and return a session_id; this is the required first step before any other tool. The AD password is elicited once and cached only in server memory, and the response includes computer name, OS version, and last boot time for triage.
         """
         auth_error = await _ensure_ad_password(ctx)
         if auth_error is not None:
@@ -71,17 +72,17 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
         return sm.connect(host, port)
 
     @mcp.tool()
-    def disconnect(session_id: str) -> dict[str, Any]:
-        """Close a WinRM session when you are done. Always disconnect when finished — sessions are not automatically cleaned up. Call list_sessions first if you need to find the session_id.
-
-        Args:
-            session_id: Session ID returned by connect.
+    def disconnect(
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+    ) -> dict[str, Any]:
+        """Close an active WinRM session and release it; sessions are not auto-cleaned, so always disconnect when done. If you don't have the session_id, call list_sessions first.
         """
         return sm.disconnect(session_id)
 
     @mcp.tool()
     def list_sessions() -> dict[str, Any]:
-        """List all active WinRM sessions with host, connection time, last used time, and command count. Use this to find session IDs or check if you are already connected to a host."""
+        """List active WinRM sessions with host, connection time, last used time, and command count. Use it to find a session_id or check whether you are already connected to a host.
+        """
         return sm.list_sessions()
 
     # ==================================================================
@@ -89,12 +90,11 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
     # ==================================================================
 
     @mcp.tool()
-    def list_directory(session_id: str, path: str) -> dict[str, Any]:
-        """List files and directories at the given path, showing Mode, LastWriteTime, Length, and Name (max 200 entries). Returns tabular text output. Use this to explore directory structure; use find_files to search recursively by pattern instead.
-
-        Args:
-            session_id: Session ID from connect.
-            path: Absolute directory path (e.g. 'C:\\Users' or 'D:\\Logs').
+    def list_directory(
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        path: Annotated[str, Field(description="Absolute directory path to list, e.g. 'C:\\Users' or 'D:\\Logs'")],
+    ) -> dict[str, Any]:
+        """List files and directories at a path as tabular text (Mode, LastWriteTime, Length, Name; max 200 entries). Use this to explore one folder; use find_files to search recursively by pattern instead.
         """
         safe = _ps_escape(path)
         cmd = (
@@ -106,20 +106,13 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     def find_files(
-        session_id: str,
-        path: str,
-        pattern: str,
-        max_depth: int = 5,
-        include_size: bool = True,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        path: Annotated[str, Field(description="Root directory to start the recursive search from")],
+        pattern: Annotated[str, Field(description="Filename wildcard to match, e.g. '*.log', '*.config', 'server.xml'")],
+        max_depth: Annotated[int, Field(description="Maximum recursion depth, default 5, capped at 10")] = 5,
+        include_size: Annotated[bool, Field(description="Include each file's size in the output, default true")] = True,
     ) -> dict[str, Any]:
-        """Recursively search for files matching a wildcard pattern, returning FullName, Size, and LastWriteTime (max 100 results). Finds files only, not directories — use list_directory to browse folders. Returns tabular text output.
-
-        Args:
-            session_id: Session ID from connect.
-            path: Root directory to search from.
-            pattern: Wildcard pattern (e.g. '*.log', '*.config', 'server.xml').
-            max_depth: Recursion depth limit (default 5, max 10).
-            include_size: Include file size in output (default true).
+        """Recursively find files matching a wildcard pattern, returning FullName, Size, and LastWriteTime as tabular text (max 100 results). Matches files only, not directories — use list_directory to browse a single folder.
         """
         safe_path = _ps_escape(path)
         safe_pattern = _ps_escape(pattern)
@@ -136,22 +129,14 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     def read_file(
-        session_id: str,
-        path: str,
-        start_line: int = 1,
-        end_line: int = 200,
-        tail: bool = False,
-        encoding: str = "UTF8",
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        path: Annotated[str, Field(description="Absolute path of the file to read")],
+        start_line: Annotated[int, Field(description="First 1-based line to return in range mode, ignored when tail=True")] = 1,
+        end_line: Annotated[int, Field(description="Last line in range mode, or line count from end in tail mode")] = 200,
+        tail: Annotated[bool, Field(description="Read the last N lines instead of a range; ideal for logs")] = False,
+        encoding: Annotated[str, Field(description="File encoding, default UTF8; use 'Unicode' for UTF-16 legacy files")] = "UTF8",
     ) -> dict[str, Any]:
-        """Read file contents with numbered lines (max 500 lines per call). Returns plain text with '     1|line content' format. Two modes: (1) Range mode (default): reads lines start_line through end_line from the top. (2) Tail mode (tail=True): reads the last N lines from end of file where N=end_line — fast even on huge files, ideal for checking recent log entries.
-
-        Args:
-            session_id: Session ID from connect.
-            path: Absolute file path.
-            start_line: First line to return (1-based, default 1). Ignored when tail=True.
-            end_line: Range mode: last line number to return (default 200). Tail mode: number of lines from the end to return.
-            tail: When true, read last N lines instead of a range from start. Use for logs.
-            encoding: File encoding (default UTF8). Use 'Unicode' for UTF-16 legacy files.
+        """Read file contents as numbered lines (max 500 per call) in '     1|line' format. Range mode reads start_line through end_line; tail mode (tail=True) reads the last N lines and stays fast even on huge files.
         """
         enc_lookup = {e: e for e in VALID_ENCODINGS}
         enc_key = encoding.strip().lower()
@@ -192,41 +177,15 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     def search_file_content(
-        session_id: str,
-        path: str,
-        pattern: str,
-        file_filter: str = "*",
-        max_results: int = 50,
-        context_lines: int = 0,
-        modified_after_hours: int = 0,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        path: Annotated[str, Field(description="Single file, or narrowest directory to search recursively")],
+        pattern: Annotated[str, Field(description="Distinctive literal text to find; no regex or wildcards")],
+        file_filter: Annotated[str, Field(description="Filename wildcard for directory searches, e.g. '*.log'; override the '*' default")] = "*",
+        max_results: Annotated[int, Field(description="Max matching lines to return, default 50, capped at 100")] = 50,
+        context_lines: Annotated[int, Field(description="Lines shown before and after each match, default 0, max 10")] = 0,
+        modified_after_hours: Annotated[int, Field(description="Only search files changed within this many hours; 0 means all files")] = 0,
     ) -> dict[str, Any]:
-        """Search for literal text inside files, like grep. Pass a single file path to search that file, or a directory path to search recursively across files matching file_filter. Pattern is literal only — no regex or wildcards in the search text.
-
-        EFFICIENCY GUIDANCE — READ BEFORE CALLING ON A DIRECTORY:
-        Recursive searches against large directories can scan gigabytes of files and time out or return noisy stale matches. To keep calls fast and relevant you MUST narrow the search BEFORE invoking this tool:
-
-        1. SCOPE THE PATH as tightly as possible. Prefer a specific subdirectory over a broad root. If you do not know the layout, call list_directory first to identify the right subfolder.
-        2. ALWAYS set modified_after_hours when path is a directory and you are investigating recent activity. Typical values:
-           - Active incident / "happening now": 1–6 hours
-           - Today's issue: 24 hours
-           - Recent regression: 72–168 hours
-           Only use 0 (all files) when you have an explicit reason to inspect historical files.
-        3. USE A PRECISE file_filter to exclude rotated archives and unrelated file types. Prefer the most specific pattern that still covers the likely source.
-        4. PICK A DISCRIMINATING pattern. Literal, distinctive strings (exception class names, error codes, correlation IDs, stack frame signatures) return useful results; generic words like 'error' or 'failed' flood the cap and hide real matches. If you need multiple variants, run several targeted searches instead of one broad one.
-        5. KEEP max_results modest (default 50 is usually right). If you hit the cap, tighten the filters above rather than raising the cap — truncated results mean the search was too broad.
-        6. USE context_lines sparingly (2–3) only when you need surrounding log lines to interpret a match; 0 is faster and sufficient for counting/locating hits.
-        7. FOR A KNOWN SINGLE FILE, pass the file path directly instead of its parent directory — this skips directory enumeration entirely.
-
-        If you are unsure how big a directory is, call find_files or list_directory first to gauge volume, then come back with scoped arguments.
-
-        Args:
-            session_id: Session ID from connect.
-            path: File path, or directory to search recursively. Prefer the narrowest subdirectory that could contain the match.
-            pattern: Exact text to search for (literal match, no regex). Choose a distinctive string to avoid noisy results.
-            file_filter: Wildcard filter when path is a directory (e.g. '*.log', 'error*.log', '*.xml'). Default '*' scans everything — override it.
-            max_results: Max matching lines to return (default 50, max 100). If you hit this cap, tighten filters instead of raising it.
-            context_lines: Lines before and after each match, like grep -C (default 0, max 10). Use 2–3 only when needed.
-            modified_after_hours: Only search files changed within this many hours (0 = all files).
+        """Search for literal text inside files like grep; pass a file path to search one file or a directory to search recursively across files matching file_filter. Recursive searches can scan huge volumes, so scope the path, set modified_after_hours, and pick a discriminating pattern to stay fast and avoid hitting the result cap.
         """
         safe_path = _ps_escape(path)
         safe_pattern = _ps_escape(pattern)
@@ -270,12 +229,11 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
         return sm.run_ps(session_id, cmd, tool_name="search_file_content")
 
     @mcp.tool()
-    def file_info(session_id: str, path: str) -> dict[str, Any]:
-        """Get metadata for a single file or directory: size in bytes/KB, created/modified/accessed timestamps, and attributes. Returns a JSON object. Use this to check file size before reading, or to verify a path exists.
-
-        Args:
-            session_id: Session ID from connect.
-            path: Absolute path to file or directory.
+    def file_info(
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        path: Annotated[str, Field(description="Absolute path to the file or directory to inspect")],
+    ) -> dict[str, Any]:
+        """Return JSON metadata for one file or directory: size in bytes/KB, created/modified/accessed timestamps, and attributes. Use it to check file size before reading or to verify a path exists.
         """
         safe = _ps_escape(path)
         cmd = (
@@ -297,22 +255,14 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     def get_event_log(
-        session_id: str,
-        log_name: str = "System",
-        level: str = "Error",
-        hours_back: int = 24,
-        source: str = "",
-        count: int = 25,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        log_name: Annotated[str, Field(description="Event log to read: System (default), Application, or Security")] = "System",
+        level: Annotated[str, Field(description="Severity threshold including higher: Critical, Error (default), Warning, or Info")] = "Error",
+        hours_back: Annotated[int, Field(description="How many hours back to search, default 24, capped at 720")] = 24,
+        source: Annotated[str, Field(description="Provider name filter, wildcards allowed, e.g. '*SQL*'")] = "",
+        count: Annotated[int, Field(description="Max events to return, default 25, capped at 100")] = 25,
     ) -> dict[str, Any]:
-        """Read Windows Event Log — the primary diagnostic source for crashes, service failures, auth errors, and disk warnings. Setting level includes that level AND all higher severities: 'Warning' returns Warning+Error+Critical, 'Error' returns Error+Critical. Check Application log for app crashes, System for OS/driver issues, Security for auth failures.
-
-        Args:
-            session_id: Session ID from connect.
-            log_name: Event log name: System (default), Application, or Security.
-            level: Severity threshold — includes this level and above. Critical, Error (default), Warning, or Info.
-            hours_back: How far back to search in hours (default 24, max 720).
-            source: Filter by provider name (e.g. '*SQL*', 'Microsoft-Windows-Security-SPP'). Wildcard OK.
-            count: Max events to return (default 25, max 100).
+        """Read the Windows Event Log, the primary source for crashes, service failures, auth errors, and disk warnings; the level threshold includes that severity and all higher ones. Check Application for app crashes, System for OS/driver issues, and Security for auth failures.
         """
         safe_log = _ps_escape(log_name)
         cap = max(1, min(count, 100))
@@ -352,18 +302,12 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     def get_services(
-        session_id: str,
-        name_filter: str = "",
-        status_filter: str = "All",
-        detail: bool = False,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        name_filter: Annotated[str, Field(description="Wildcard on Name or DisplayName, e.g. '*sql*', '*jboss*'")] = "",
+        status_filter: Annotated[str, Field(description="Filter by state: Running, Stopped, or All (default)")] = "All",
+        detail: Annotated[bool, Field(description="Deep JSON inspection per service; best paired with a name_filter")] = False,
     ) -> dict[str, Any]:
-        """List Windows services. Summary mode (default) returns a quick tabular overview with Name, Status, StartType, DisplayName. Detail mode (detail=True) returns structured JSON per service with full inspection data: binary path, working directory, logon account, PID, memory, delayed auto-start, exit codes, dependencies, description, and recovery actions. Use summary to find services, then detail to inspect before restarting.
-
-        Args:
-            session_id: Session ID from connect.
-            name_filter: Wildcard filter on Name or DisplayName (e.g. '*sql*', '*jboss*', 'AQS').
-            status_filter: Running, Stopped, or All (default All).
-            detail: Deep inspection mode returning JSON. Shows binary_path, working_directory, service_account, PID, memory_mb, delayed_auto_start, win32_exit_code, service_exit_code, dependencies, depended_by, description, and recovery actions. Best used with a name_filter to inspect specific services.
+        """List Windows services: summary mode (default) returns tabular Name, Status, StartType, DisplayName, while detail mode returns JSON per service with binary path, account, PID, memory, exit codes, dependencies, and recovery actions. Use summary to find a service, then detail to inspect it before restarting.
         """
         where_clauses: list[str] = []
 
@@ -430,18 +374,12 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     def list_processes(
-        session_id: str,
-        name_filter: str = "",
-        sort_by: str = "Memory",
-        top: int = 30,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        name_filter: Annotated[str, Field(description="Wildcard on process name, e.g. 'java*', 'w3wp*', 'sqlservr*'")] = "",
+        sort_by: Annotated[str, Field(description="Sort descending by CPU or Memory (default)")] = "Memory",
+        top: Annotated[int, Field(description="Number of processes to show, default 30, capped at 100")] = 30,
     ) -> dict[str, Any]:
-        """List running processes showing PID, name, CPU seconds, memory in MB, handle count, and start time. Use to identify resource hogs, confirm an application is running, or check for hung processes. Returns tabular text sorted descending by the chosen metric.
-
-        Args:
-            session_id: Session ID from connect.
-            name_filter: Wildcard on process name (e.g. 'java*', 'w3wp*', 'sqlservr*').
-            sort_by: Sort by CPU or Memory (default Memory).
-            top: Number of processes to show (default 30, max 100).
+        """List running processes as tabular text with PID, name, CPU seconds, memory MB, handle count, and start time, sorted descending by the chosen metric. Use it to spot resource hogs, confirm an app is running, or find hung processes.
         """
         cap = max(1, min(top, 100))
         sort_prop = "WorkingSet64" if sort_by.strip().lower() != "cpu" else "CPU"
@@ -466,11 +404,10 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
         return sm.run_ps(session_id, cmd, tool_name="list_processes")
 
     @mcp.tool()
-    def get_system_info(session_id: str) -> dict[str, Any]:
-        """Get full system overview in one call — OS version, uptime, last boot time, total/free RAM, CPU count, domain, and timezone. Call this first after connect to establish triage context. Returns a JSON object.
-
-        Args:
-            session_id: Session ID from connect.
+    def get_system_info(
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+    ) -> dict[str, Any]:
+        """Return a JSON system overview in one call: OS version, uptime, last boot, total/free RAM, CPU count, domain, and timezone. Call it right after connect to establish triage context.
         """
         cmd = (
             "$os = Get-CimInstance Win32_OperatingSystem; "
@@ -492,11 +429,10 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
         return sm.run_ps(session_id, cmd, tool_name="get_system_info")
 
     @mcp.tool()
-    def get_disk_space(session_id: str) -> dict[str, Any]:
-        """Get disk space for all fixed drives — DeviceID, Total_GB, Free_GB, and Used_Pct. Disk full is a top-5 cause of production incidents. Returns tabular text, one row per drive.
-
-        Args:
-            session_id: Session ID from connect.
+    def get_disk_space(
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+    ) -> dict[str, Any]:
+        """Return disk space for all fixed drives as tabular text: DeviceID, Total_GB, Free_GB, and Used_Pct. A full disk is a top cause of production incidents, so check this early during triage.
         """
         cmd = (
             "Get-CimInstance Win32_LogicalDisk -Filter \"DriveType=3\" "
@@ -510,18 +446,12 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     def get_perf_snapshot(
-        session_id: str,
-        samples: int = 3,
-        interval_sec: int = 2,
-        process_filter: str = "",
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        samples: Annotated[int, Field(description="Samples to average, default 3, max 10; more is smoother but slower")] = 3,
+        interval_sec: Annotated[int, Field(description="Seconds between samples, default 2, capped at 10")] = 2,
+        process_filter: Annotated[str, Field(description="Wildcard for per-process counters; empty omits that section for speed")] = "",
     ) -> dict[str, Any]:
-        """Capture a performance counter snapshot — CPU, memory, disk I/O, network, TCP connections, and optionally per-process stats for filtered processes. Samples are averaged to smooth out single-second noise. Use this to answer "is the server healthy?", "is it CPU-bound?", "is disk thrashing?", or "how much memory is Java using?". Returns a structured JSON object. Takes (samples × interval_sec) seconds to complete.
-
-        Args:
-            session_id: Session ID from connect.
-            samples: Number of samples to average (default 3, max 10). More samples = smoother data but slower.
-            interval_sec: Seconds between samples (default 2, max 10).
-            process_filter: Wildcard filter for per-process counters (e.g. 'java*', 'w3wp*', 'sqlservr*'). If empty, per-process section is omitted for speed.
+        """Capture an averaged performance snapshot as JSON: CPU, memory, disk I/O, network, TCP connections, and optionally per-process stats. Use it to judge whether the server is healthy, CPU-bound, or disk-thrashing; it takes roughly samples × interval_sec seconds.
         """
         cap_samples = max(1, min(samples, 10))
         cap_interval = max(1, min(interval_sec, 10))
@@ -615,16 +545,11 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     def test_network(
-        session_id: str,
-        target: str,
-        port: int = 0,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        target: Annotated[str, Field(description="Hostname or IP to test connectivity to")],
+        port: Annotated[int, Field(description="TCP port to test, or 0 (default) for an ICMP ping")] = 0,
     ) -> dict[str, Any]:
-        """Test network connectivity FROM the remote Windows host's perspective. With port=0 sends 3 ICMP pings (tabular text). With port>0 tests TCP connectivity and returns JSON with TcpTestSucceeded boolean. Note: TCP port tests can take 20-35 seconds if the port is blocked. Common ports: 1433 SQL, 5985 WinRM, 443 HTTPS, 3389 RDP, 8080 HTTP.
-
-        Args:
-            session_id: Session ID from connect.
-            target: Hostname or IP to test connectivity to.
-            port: TCP port to test. Set 0 for ICMP ping (default), or a port number for TCP test.
+        """Test connectivity from the remote Windows host's perspective: port=0 sends three ICMP pings as tabular text, while port>0 runs a TCP test returning JSON with a TcpTestSucceeded boolean. A blocked TCP port test can take 20-35 seconds.
         """
         safe_target = _ps_escape(target)
 
@@ -654,16 +579,11 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     def get_registry(
-        session_id: str,
-        key: str,
-        value_name: str = "",
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        key: Annotated[str, Field(description="Registry path with 'HKLM:\\' prefix; HKEY_LOCAL_MACHINE form also accepted")],
+        value_name: Annotated[str, Field(description="Single value to read; empty dumps all values under the key")] = "",
     ) -> dict[str, Any]:
-        """Read a registry key or specific value (read-only). Returns JSON. Use to check service configurations, installed software versions, TLS/crypto settings, or feature flags. Pass value_name to read one value, or omit it to dump all values under the key.
-
-        Args:
-            session_id: Session ID from connect.
-            key: Registry path. Use 'HKLM:\\' prefix (e.g. 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion'). Also accepts HKEY_LOCAL_MACHINE format.
-            value_name: Specific value name to read (e.g. 'ProductName'). If empty, returns all values under the key.
+        """Read a registry key or a single value (read-only) and return JSON. Use it to check service configuration, installed software versions, TLS/crypto settings, or feature flags.
         """
         k = key.strip()
         if k.upper().startswith("HKEY_"):
@@ -689,16 +609,11 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     def get_certificates(
-        session_id: str,
-        store: str = "LocalMachine",
-        days_until_expiry: int = 0,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        store: Annotated[str, Field(description="Certificate store location: LocalMachine (default) or CurrentUser")] = "LocalMachine",
+        days_until_expiry: Annotated[int, Field(description="Only show certs expiring within this many days; 0 shows all")] = 0,
     ) -> dict[str, Any]:
-        """List certificates from the Personal (My) certificate store, sorted by days until expiry. Shows Subject, Expires date, DaysLeft, and Thumbprint. Cert expiry is a top cause of silent outages — set days_until_expiry to filter for certs expiring soon. Only checks the 'My' (Personal) store, not Root or CA stores.
-
-        Args:
-            session_id: Session ID from connect.
-            store: LocalMachine (default) or CurrentUser.
-            days_until_expiry: Only show certs expiring within this many days (0 = show all certs).
+        """List certificates from the Personal (My) store sorted by days until expiry, showing Subject, Expires, DaysLeft, and Thumbprint. Cert expiry is a top cause of silent outages, so set days_until_expiry to surface certs expiring soon.
         """
         store_map = {"localmachine": "LocalMachine", "currentuser": "CurrentUser"}
         st = store_map.get(store.strip().lower())
@@ -726,11 +641,10 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
         return sm.run_ps(session_id, cmd, tool_name="get_certificates")
 
     @mcp.tool()
-    def get_network_config(session_id: str) -> dict[str, Any]:
-        """Get network adapter configuration — interface name, status (Up/Down), IPv4 address, default gateway, and DNS servers for each NIC. Essential for network triage: confirms IP assignment, DNS resolution, and gateway reachability. Returns tabular text.
-
-        Args:
-            session_id: Session ID from connect.
+    def get_network_config(
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+    ) -> dict[str, Any]:
+        """Return per-NIC network configuration as tabular text: interface name, Up/Down status, IPv4 address, default gateway, and DNS servers. Essential for network triage to confirm IP assignment, DNS, and gateway reachability.
         """
         cmd = (
             "Get-NetIPConfiguration -ErrorAction SilentlyContinue "
@@ -749,16 +663,11 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     def get_environment_variables(
-        session_id: str,
-        name_filter: str = "",
-        scope: str = "Machine",
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        name_filter: Annotated[str, Field(description="Wildcard on variable name, e.g. '*JAVA*', '*PATH*'; empty means all")] = "",
+        scope: Annotated[str, Field(description="Variable scope: Machine (default), User, or Process")] = "Machine",
     ) -> dict[str, Any]:
-        """Get environment variables. Shows name and value for the selected scope. Use to check JAVA_HOME, PATH, service-specific env vars, or any system/user configuration. Returns tabular text.
-
-        Args:
-            session_id: Session ID from connect.
-            name_filter: Wildcard filter on variable name (e.g. '*JAVA*', '*PATH*'). Empty = all.
-            scope: Machine (default), User, or Process.
+        """Return environment variables (name and value) for the chosen scope as tabular text. Use it to check JAVA_HOME, PATH, or service-specific configuration.
         """
         scope_map = {"machine": "Machine", "user": "User", "process": "Process"}
         sc = scope_map.get(scope.strip().lower())
@@ -781,16 +690,11 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     def get_scheduled_tasks(
-        session_id: str,
-        name_filter: str = "",
-        include_disabled: bool = False,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        name_filter: Annotated[str, Field(description="Wildcard on task name, e.g. '*backup*'; empty means all non-Microsoft tasks")] = "",
+        include_disabled: Annotated[bool, Field(description="Include disabled tasks; default shows only Ready/Running")] = False,
     ) -> dict[str, Any]:
-        """List Windows scheduled tasks showing name, state, last run time, last result, and next run time. Essential for understanding what automated jobs run on this server (backups, cleanup, AQS jobs, batch processes). Returns tabular text.
-
-        Args:
-            session_id: Session ID from connect.
-            name_filter: Wildcard filter on task name (e.g. '*backup*', '*AQS*'). Empty = all non-Microsoft tasks.
-            include_disabled: Include disabled tasks (default False — only shows Ready/Running).
+        """List Windows scheduled tasks as tabular text with name, state, last run time, last result, and next run time. Use it to see what automated jobs (backups, cleanup, batch processes) run on this server.
         """
         where_parts: list[str] = []
 
@@ -825,11 +729,10 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
         return sm.run_ps(session_id, cmd, tool_name="get_scheduled_tasks")
 
     @mcp.tool()
-    def get_local_users(session_id: str) -> dict[str, Any]:
-        """List local user accounts on the server showing name, enabled status, last logon, and description. Use to check for rogue accounts, locked-out service accounts, or disabled accounts. Returns tabular text.
-
-        Args:
-            session_id: Session ID from connect.
+    def get_local_users(
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+    ) -> dict[str, Any]:
+        """List local user accounts as tabular text with name, enabled status, last logon, and description. Use it to spot rogue accounts, locked-out service accounts, or disabled accounts.
         """
         cmd = (
             "Get-LocalUser -ErrorAction Stop "
@@ -844,14 +747,10 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     def get_user_groups(
-        session_id: str,
-        username: str = "",
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        username: Annotated[str, Field(description="User to look up, e.g. 'DOMAIN\\\\svc-account'; empty lists all local groups")] = "",
     ) -> dict[str, Any]:
-        """Show local group memberships. With no username, lists all local groups and their members. With a username, shows which local groups that user belongs to (matches both local and domain\\user formats). For full AD domain group membership of the current WinRM session, use get_security_context instead — it reads groups directly from the authentication token without needing DC access. Returns tabular text.
-
-        Args:
-            session_id: Session ID from connect.
-            username: User to look up (e.g. 'Administrator', 'DOMAIN\\\\svc-account'). Empty = list all local groups with members.
+        """Show local group memberships as tabular text: with no username it lists all local groups and members, with a username it shows that user's local groups. For full AD domain group membership of the current session, use get_security_context instead.
         """
         if username.strip():
             safe_user = _ps_escape(username.strip())
@@ -881,11 +780,10 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
         return sm.run_ps(session_id, cmd, tool_name="get_user_groups")
 
     @mcp.tool()
-    def get_security_context(session_id: str) -> dict[str, Any]:
-        """Show the current WinRM session's security context — equivalent to 'whoami /all'. Returns the identity running commands, group memberships (including AD domain groups), privileges, and integrity level. Essential for diagnosing 'access denied' errors and understanding what the service account can actually do.
-
-        Args:
-            session_id: Session ID from connect.
+    def get_security_context(
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+    ) -> dict[str, Any]:
+        """Show the current WinRM session's security context as JSON (like 'whoami /all'): identity, group memberships including AD domain groups, privileges, and integrity level. Essential for diagnosing access-denied errors and understanding what the service account can do.
         """
         cmd = (
             "$wi = [Security.Principal.WindowsIdentity]::GetCurrent(); "
@@ -913,14 +811,10 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     def get_permissions(
-        session_id: str,
-        path: str,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        path: Annotated[str, Field(description="Absolute path to the file or folder to check")],
     ) -> dict[str, Any]:
-        """Get the access control list (ACL) for a file or folder. Shows each permission entry: who has access, what type (Allow/Deny), and what rights (FullControl, Read, Write, Modify, etc.). Essential for troubleshooting "access denied" errors. Returns tabular text.
-
-        Args:
-            session_id: Session ID from connect.
-            path: Absolute path to the file or folder to check.
+        """Return the access control list (ACL) for a file or folder as tabular text: each entry's identity, Allow/Deny type, rights, and inheritance. Essential for troubleshooting access-denied errors.
         """
         safe = _ps_escape(path)
         cmd = (
@@ -943,16 +837,11 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     def get_tcp_connections(
-        session_id: str,
-        state_filter: str = "Established",
-        port_filter: int = 0,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        state_filter: Annotated[str, Field(description="State filter: Established (default), Listen, TimeWait, CloseWait, or All")] = "Established",
+        port_filter: Annotated[int, Field(description="Only show connections involving this port; 0 means all ports")] = 0,
     ) -> dict[str, Any]:
-        """List active TCP connections showing local/remote addresses, ports, state, and owning process. Like 'ss -tnp' or 'netstat -an' on Linux. Use to check database connections, find connection leaks, or see what's talking to what. Returns tabular text.
-
-        Args:
-            session_id: Session ID from connect.
-            state_filter: Filter by state: Established (default), Listen, TimeWait, CloseWait, All.
-            port_filter: Only show connections involving this port (0 = all ports).
+        """List active TCP connections as tabular text with local/remote addresses, ports, state, and owning process (like netstat -an). Use it to check database connections, find connection leaks, or see what is talking to what.
         """
         state_map = {
             "established": "Established", "listen": "Listen",
@@ -993,14 +882,10 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     def get_dns_cache(
-        session_id: str,
-        name_filter: str = "",
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        name_filter: Annotated[str, Field(description="Wildcard on record name, e.g. '*sql*'; empty means all entries")] = "",
     ) -> dict[str, Any]:
-        """Read the local DNS client cache. Shows cached DNS lookups with record name, type, TTL, and resolved data. Use to diagnose "it resolves wrong from this server" or stale DNS after a migration. Returns tabular text.
-
-        Args:
-            session_id: Session ID from connect.
-            name_filter: Wildcard filter on record name (e.g. '*sql*', '*myapp*'). Empty = all cached entries.
+        """Read the local DNS client cache as tabular text: cached record name, type, TTL, and resolved data. Use it to diagnose wrong resolution from this server or stale DNS after a migration.
         """
         name_where = ""
         if name_filter.strip():
@@ -1022,14 +907,10 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     def get_installed_software(
-        session_id: str,
-        name_filter: str = "",
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        name_filter: Annotated[str, Field(description="Wildcard on software name, e.g. '*java*', '*.NET*'; empty means all")] = "",
     ) -> dict[str, Any]:
-        """List installed software with name, version, publisher, and install date. Reads from both 64-bit and 32-bit uninstall registry keys. Use to check Java, .NET, SQL, or any application version. Returns tabular text.
-
-        Args:
-            session_id: Session ID from connect.
-            name_filter: Wildcard filter on software name (e.g. '*java*', '*sql*', '*.NET*'). Empty = all.
+        """List installed software as tabular text with name, version, publisher, and install date, reading both 64-bit and 32-bit uninstall keys. Use it to check Java, .NET, SQL, or any application version.
         """
         name_where = ""
         if name_filter.strip():
@@ -1051,18 +932,12 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     def compare_files(
-        session_id: str,
-        path_a: str,
-        path_b: str,
-        max_diffs: int = 50,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        path_a: Annotated[str, Field(description="Absolute path to the first file (reference)")],
+        path_b: Annotated[str, Field(description="Absolute path to the second file (difference)")],
+        max_diffs: Annotated[int, Field(description="Maximum differing lines to show, default 50, capped at 200")] = 50,
     ) -> dict[str, Any]:
-        """Compare two files and show the differences line by line (like diff). Shows line number and which file each differing line belongs to (=> file A, <= file B). Use to compare configs between environments. Returns text output.
-
-        Args:
-            session_id: Session ID from connect.
-            path_a: Absolute path to the first file.
-            path_b: Absolute path to the second file.
-            max_diffs: Maximum number of differing lines to show (default 50).
+        """Compare two files line by line like diff, showing each differing line and which file it came from. Use it to compare configs between environments.
         """
         safe_a = _ps_escape(path_a)
         safe_b = _ps_escape(path_b)
@@ -1091,18 +966,12 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     def resolve_dns_name(
-        session_id: str,
-        name: str,
-        record_type: str = "A",
-        dns_server: str = "",
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        name: Annotated[str, Field(description="Hostname or FQDN to resolve, e.g. 'db.example.com'")],
+        record_type: Annotated[str, Field(description="Record type: A (default), AAAA, CNAME, MX, NS, PTR, SOA, SRV, TXT")] = "A",
+        dns_server: Annotated[str, Field(description="Specific DNS server to query; empty uses the system default")] = "",
     ) -> dict[str, Any]:
-        """Resolve a DNS name from the remote server's perspective. Shows the full resolution chain including CNAMEs. Use to verify DNS propagation, check what IP a hostname resolves to, or compare resolution between servers. Returns tabular text.
-
-        Args:
-            session_id: Session ID from connect.
-            name: Hostname or FQDN to resolve (e.g. 'db-server-01', 'db.example.com').
-            record_type: DNS record type: A (default), AAAA, CNAME, MX, NS, PTR, SOA, SRV, TXT.
-            dns_server: Specific DNS server to query (optional). Empty = use system default DNS.
+        """Resolve a DNS name from the remote server's perspective as tabular text, showing the full resolution chain including CNAMEs. Use it to verify DNS propagation or compare resolution between servers.
         """
         valid_types = {"a", "aaaa", "cname", "mx", "ns", "ptr", "soa", "srv", "txt"}
         rt = record_type.strip().upper()
@@ -1150,13 +1019,10 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     async def flush_dns(
-        session_id: str,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
         ctx: Context,
     ) -> dict[str, Any]:
-        """Clear the local DNS client cache on the remote server. Forces all future DNS lookups to re-resolve from the DNS server. Harmless operation but prompts for confirmation. Use after a DNS migration, failover, or when stale DNS entries are suspected.
-
-        Args:
-            session_id: Session ID from connect.
+        """Clear the local DNS client cache on the remote server so future lookups re-resolve; harmless but prompts for confirmation. Use it after a DNS migration, failover, or when stale entries are suspected.
         """
         confirmed = await _confirm(
             ctx, "FLUSH DNS CACHE",
@@ -1175,23 +1041,15 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     async def invoke_http_request(
-        session_id: str,
-        url: str,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        url: Annotated[str, Field(description="Full URL to request, e.g. 'http://localhost:8080/health'")],
         ctx: Context,
-        method: str = "GET",
-        headers: str = "",
-        body: str = "",
-        timeout_sec: int = 15,
+        method: Annotated[str, Field(description="HTTP method: GET (default), HEAD, POST, PUT, or DELETE")] = "GET",
+        headers: Annotated[str, Field(description="Optional 'Key:Value' header pairs separated by '|'")] = "",
+        body: Annotated[str, Field(description="Optional request body for POST/PUT, max 64KB")] = "",
+        timeout_sec: Annotated[int, Field(description="Request timeout in seconds, default 15, capped at 60")] = 15,
     ) -> dict[str, Any]:
-        """Make an HTTP request FROM the remote Windows server. Tests connectivity and API health from the server's network perspective. Supports GET, HEAD, POST, PUT, DELETE. Shows status code, headers, and response body. Prompts for confirmation since it makes a network request from the remote host.
-
-        Args:
-            session_id: Session ID from connect.
-            url: Full URL to request (e.g. 'http://localhost:8080/health', 'https://api.example.com/status').
-            method: HTTP method: GET (default), HEAD, POST, PUT, DELETE.
-            headers: Optional headers as 'Key:Value' pairs separated by '|' (e.g. 'Content-Type:application/json|Accept:text/plain').
-            body: Optional request body for POST/PUT. Max 64KB.
-            timeout_sec: Request timeout in seconds (default 15, max 60).
+        """Make an HTTP request from the remote Windows server and return status code, headers, and body; prompts for confirmation. Use it to test connectivity and API health from that host's network perspective.
         """
         valid_methods = {"GET", "HEAD", "POST", "PUT", "DELETE"}
         m = method.strip().upper()
@@ -1282,19 +1140,13 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     async def compress_archive(
-        session_id: str,
-        source_path: str,
-        destination_zip: str,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        source_path: Annotated[str, Field(description="File or directory to compress, e.g. 'C:\\App\\config'")],
+        destination_zip: Annotated[str, Field(description="Output .zip path, e.g. 'C:\\backup\\configs.zip'")],
         ctx: Context,
-        overwrite: bool = False,
+        overwrite: Annotated[bool, Field(description="Allow overwriting an existing zip file, default False")] = False,
     ) -> dict[str, Any]:
-        """Compress a file or directory into a .zip archive. Prompts for confirmation. Use to archive logs, back up config directories, or bundle files for transfer. Shows the resulting archive size.
-
-        Args:
-            session_id: Session ID from connect.
-            source_path: File or directory to compress (e.g. 'C:\\App\\config' or 'C:\\temp\\myfile.log').
-            destination_zip: Path for the output .zip file (e.g. 'C:\\backup\\configs.zip').
-            overwrite: Allow overwriting an existing zip file (default False).
+        """Compress a file or directory into a .zip archive and report the resulting size; prompts for confirmation. Use it to archive logs, back up config directories, or bundle files for transfer.
         """
         safe_src = _ps_escape(source_path)
         safe_dst = _ps_escape(destination_zip)
@@ -1346,19 +1198,13 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     async def expand_archive(
-        session_id: str,
-        zip_path: str,
-        destination_dir: str,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        zip_path: Annotated[str, Field(description="Absolute path to the .zip file to extract")],
+        destination_dir: Annotated[str, Field(description="Target directory to extract into, created if missing")],
         ctx: Context,
-        overwrite: bool = False,
+        overwrite: Annotated[bool, Field(description="Overwrite existing files in the destination, default False")] = False,
     ) -> dict[str, Any]:
-        """Extract a .zip archive to a directory. Prompts for confirmation showing archive size and entry count. Use to unpack backups, deploy packages, or restore config archives.
-
-        Args:
-            session_id: Session ID from connect.
-            zip_path: Path to the .zip file to extract.
-            destination_dir: Directory to extract into (created if it doesn't exist).
-            overwrite: Overwrite existing files in destination (default False).
+        """Extract a .zip archive to a directory; prompts for confirmation showing archive size and entry count. Use it to unpack backups, deploy packages, or restore config archives.
         """
         safe_zip = _ps_escape(zip_path)
         safe_dst = _ps_escape(destination_dir)
@@ -1405,19 +1251,13 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     async def copy_file(
-        session_id: str,
-        source: str,
-        destination: str,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        source: Annotated[str, Field(description="Absolute path of the file to copy")],
+        destination: Annotated[str, Field(description="Absolute destination path for the copy")],
         ctx: Context,
-        overwrite: bool = False,
+        overwrite: Annotated[bool, Field(description="Allow overwriting the destination if it exists, default False")] = False,
     ) -> dict[str, Any]:
-        """Copy a file to a new location. Prompts the user for confirmation. Does NOT overwrite by default — set overwrite=True to replace an existing destination file.
-
-        Args:
-            session_id: Session ID from connect.
-            source: Absolute path of the file to copy.
-            destination: Absolute path for the copy.
-            overwrite: Allow overwriting the destination if it exists (default False).
+        """Copy a file to a new location; prompts for confirmation and does not overwrite unless overwrite=True. Returns the resulting file's name, size, and modified time.
         """
         confirmed = await _confirm(
             ctx, "COPY FILE",
@@ -1449,17 +1289,12 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     async def rename_file(
-        session_id: str,
-        path: str,
-        new_name: str,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        path: Annotated[str, Field(description="Absolute path of the file or directory to rename")],
+        new_name: Annotated[str, Field(description="New filename only, not a full path, e.g. 'config_v2.xml'")],
         ctx: Context,
     ) -> dict[str, Any]:
-        """Rename a file or directory (stays in the same folder). Prompts the user for confirmation. Use move_file to move across directories.
-
-        Args:
-            session_id: Session ID from connect.
-            path: Absolute path of the file or directory to rename.
-            new_name: New filename only (not a full path, e.g. 'config_v2.xml').
+        """Rename a file or directory in place within the same folder; prompts for confirmation. Use move_file to move across directories.
         """
         if "/" in new_name or "\\" in new_name:
             return {"error": "new_name must be a filename only, not a path. Use move_file to move across directories."}
@@ -1486,19 +1321,13 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     async def move_file(
-        session_id: str,
-        source: str,
-        destination: str,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        source: Annotated[str, Field(description="Absolute path of the file to move")],
+        destination: Annotated[str, Field(description="Absolute destination path including the filename")],
         ctx: Context,
-        overwrite: bool = False,
+        overwrite: Annotated[bool, Field(description="Allow overwriting the destination if it exists, default False")] = False,
     ) -> dict[str, Any]:
-        """Move a file to a different location. Prompts the user for confirmation. Does NOT overwrite by default. Use rename_file if staying in the same directory.
-
-        Args:
-            session_id: Session ID from connect.
-            source: Absolute path of the file to move.
-            destination: Absolute destination path (full path including filename).
-            overwrite: Allow overwriting the destination if it exists (default False).
+        """Move a file to a different location; prompts for confirmation and does not overwrite unless overwrite=True. Use rename_file when staying in the same directory.
         """
         confirmed = await _confirm(
             ctx, "MOVE FILE",
@@ -1530,15 +1359,11 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     async def create_directory(
-        session_id: str,
-        path: str,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        path: Annotated[str, Field(description="Absolute directory path to create, e.g. 'C:\\backup\\2026-04-26'")],
         ctx: Context,
     ) -> dict[str, Any]:
-        """Create a directory (and any missing parent directories). If the directory already exists, returns its info without error. Prompts for confirmation. Use this before write_file when the target folder might not exist.
-
-        Args:
-            session_id: Session ID from connect.
-            path: Absolute path of the directory to create (e.g. 'C:\\backup\\2026-04-26').
+        """Create a directory and any missing parents, prompting for confirmation; if it already exists, returns its info without error. Use it before writing files when the target folder might not exist.
         """
         safe = _ps_escape(path)
 
@@ -1588,15 +1413,11 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     async def delete_file(
-        session_id: str,
-        path: str,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        path: Annotated[str, Field(description="Absolute path to the file to delete")],
         ctx: Context,
     ) -> dict[str, Any]:
-        """Delete a single file. Shows file metadata (name, size, modified time) in the confirmation prompt so you can verify the correct file. Refuses to delete directories — use delete_directory for that.
-
-        Args:
-            session_id: Session ID from connect.
-            path: Absolute path to the file to delete.
+        """Permanently delete a single file, showing its metadata in the confirmation prompt so you can verify the target. Refuses directories — use delete_directory for those.
         """
         safe = _ps_escape(path)
 
@@ -1640,17 +1461,12 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     async def delete_directory(
-        session_id: str,
-        path: str,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        path: Annotated[str, Field(description="Absolute path to the directory to delete recursively")],
         ctx: Context,
-        max_items: int = 5000,
+        max_items: Annotated[int, Field(description="Safety cap; refuse if more items exist, default 5000, max 50000")] = 5000,
     ) -> dict[str, Any]:
-        """Delete a directory and all its contents recursively. Before confirming, scans the directory to show total file count and size. Refuses to delete if the item count exceeds max_items (default 5000) as a safety brake — raise the cap explicitly if you are sure. Will NOT delete drive roots or well-known system directories.
-
-        Args:
-            session_id: Session ID from connect.
-            path: Absolute path to the directory to delete.
-            max_items: Safety cap — refuse deletion if more than this many items exist (default 5000, max 50000). Set higher only after reviewing the scan output.
+        """Recursively delete a directory and all contents after scanning to show file count and size in the confirmation prompt. Refuses when items exceed max_items or for drive roots and well-known system directories.
         """
         safe = _ps_escape(path)
         cap = max(1, min(max_items, 50000))
@@ -1743,15 +1559,11 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     async def restart_service(
-        session_id: str,
-        name: str,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        name: Annotated[str, Field(description="Exact service name, not display name, e.g. 'JBossEAP8', 'MSSQLSERVER'")],
         ctx: Context,
     ) -> dict[str, Any]:
-        """Restart a Windows service. Captures service state before and after the restart and prompts the user for confirmation showing current status and PID. Returns both pre and post state so you can verify the restart succeeded (new PID = process recycled).
-
-        Args:
-            session_id: Session ID from connect.
-            name: Exact service name (e.g. 'JBossEAP8', 'W3SVC', 'MSSQLSERVER'). Not the display name.
+        """Restart a Windows service, prompting for confirmation and returning pre and post state so you can verify success (a new PID means the process recycled).
         """
         pre = sm.run_ps(session_id, _svc_state_cmd(name), tool_name="restart_service")
         if "error" in pre:
@@ -1782,15 +1594,11 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     async def stop_service(
-        session_id: str,
-        name: str,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        name: Annotated[str, Field(description="Exact service name, not display name, e.g. 'JBossEAP8'")],
         ctx: Context,
     ) -> dict[str, Any]:
-        """Stop a running Windows service. Captures service state before and after, prompts the user for confirmation. Use start_service to bring it back up.
-
-        Args:
-            session_id: Session ID from connect.
-            name: Exact service name (e.g. 'JBossEAP8'). Not the display name.
+        """Stop a running Windows service, prompting for confirmation and returning pre and post state. The service will not restart automatically — use start_service to bring it back up.
         """
         pre = sm.run_ps(session_id, _svc_state_cmd(name), tool_name="stop_service")
         if "error" in pre:
@@ -1821,15 +1629,11 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     async def start_service(
-        session_id: str,
-        name: str,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        name: Annotated[str, Field(description="Exact service name, not display name, e.g. 'JBossEAP8'")],
         ctx: Context,
     ) -> dict[str, Any]:
-        """Start a stopped Windows service. Captures service state before and after, prompts the user for confirmation.
-
-        Args:
-            session_id: Session ID from connect.
-            name: Exact service name (e.g. 'JBossEAP8'). Not the display name.
+        """Start a stopped Windows service, prompting for confirmation and returning pre and post state to verify it came up.
         """
         pre = sm.run_ps(session_id, _svc_state_cmd(name), tool_name="start_service")
         if "error" in pre:
@@ -1864,15 +1668,11 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     async def kill_process(
-        session_id: str,
-        pid: int,
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        pid: Annotated[int, Field(description="Process ID to kill; use list_processes to find the correct PID")],
         ctx: Context,
     ) -> dict[str, Any]:
-        """Kill a process by PID. Captures process details (name, CPU, memory, start time) before killing and shows them in the confirmation prompt. Requires PID — use list_processes first to find the right one. The process is force-terminated immediately.
-
-        Args:
-            session_id: Session ID from connect.
-            pid: Process ID to kill. Use list_processes to find the correct PID.
+        """Force-terminate a process by PID, showing its details (name, CPU, memory, start time) in the confirmation prompt. Use list_processes first to find the right PID.
         """
         pre_cmd = (
             "Get-Process -Id " + str(pid) + " -ErrorAction Stop "
@@ -1917,21 +1717,14 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
 
     @mcp.tool()
     async def set_registry(
-        session_id: str,
-        key: str,
-        value_name: str,
-        value_data: str,
-        value_type: str = "String",
+        session_id: Annotated[str, Field(description="Session ID returned by connect")],
+        key: Annotated[str, Field(description="Registry path, e.g. 'HKLM:\\SOFTWARE\\MyApp'; HKEY_LOCAL_MACHINE form also accepted")],
+        value_name: Annotated[str, Field(description="Name of the registry value to set")],
+        value_data: Annotated[str, Field(description="Data to write as a string, converted to the chosen type")],
+        value_type: Annotated[str, Field(description="Value type: String (default), DWord, QWord, ExpandString, MultiString, Binary")] = "String",
         ctx: Context = None,
     ) -> dict[str, Any]:
-        """Set a registry value. Captures the current value before writing and shows old vs new in the confirmation prompt. Creates the value if it doesn't exist. Returns both pre and post state.
-
-        Args:
-            session_id: Session ID from connect.
-            key: Registry path (e.g. 'HKLM:\\SOFTWARE\\MyApp'). Also accepts HKEY_LOCAL_MACHINE format.
-            value_name: Name of the registry value to set.
-            value_data: Data to write (as string — converted to the correct type by PowerShell).
-            value_type: Registry value type: String (default), DWord, QWord, ExpandString, MultiString, Binary.
+        """Set a registry value, creating it if absent, and show old vs new in the confirmation prompt. Returns both pre and post state.
         """
         valid_types = {"string", "dword", "qword", "expandstring", "multistring", "binary"}
         vt = value_type.strip().lower()
