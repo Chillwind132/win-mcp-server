@@ -2,6 +2,10 @@
 
 import base64
 import logging
+import os
+import threading
+import time
+from dataclasses import dataclass
 from typing import Annotated, Any
 
 from fastmcp import Context, FastMCP
@@ -21,6 +25,86 @@ EVENT_LEVELS: dict[str, str] = {
     "warning": "3",
     "info": "4",
 }
+
+SFTP_CRED_IDLE_TTL_SECONDS = int(os.environ.get("SFTP_CRED_IDLE_TTL_SECONDS", "3600"))
+
+
+@dataclass
+class _SftpCred:
+    """Cached SFTP connection parameters for one logical SFTP session.
+
+    The secret (password or key passphrase) lives only here in memory and is
+    redacted from logs whenever it is injected into a PowerShell command.
+    """
+
+    win_session_id: str
+    host: str
+    port: int
+    user: str
+    auth_method: str  # "password" | "key"
+    secret: str  # password, or key passphrase ("" if none)
+    key_path: str  # "" unless auth_method == "key"
+    timeout: int
+    last_used: float
+
+
+class _SftpCredStore:
+    """Thread-safe, per-AD-user cache of SFTP credentials with idle TTL.
+
+    Keyed by (ad_user, sftp_session_id) so users never see each other's
+    sessions. A single lock guards all access; entries expire after an idle
+    TTL and are pruned lazily on access.
+    """
+
+    def __init__(self, ttl_seconds: int) -> None:
+        self._store: dict[tuple[str, str], _SftpCred] = {}
+        self._lock = threading.Lock()
+        self._ttl = ttl_seconds
+
+    def _expired(self, cred: _SftpCred, now: float) -> bool:
+        return self._ttl > 0 and now - cred.last_used > self._ttl
+
+    def put(self, ad_user: str, sid: str, cred: _SftpCred) -> None:
+        with self._lock:
+            self._store[(ad_user, sid)] = cred
+
+    def get(self, ad_user: str, sid: str) -> _SftpCred | None:
+        now = time.monotonic()
+        with self._lock:
+            cred = self._store.get((ad_user, sid))
+            if cred is None:
+                return None
+            if self._expired(cred, now):
+                self._store.pop((ad_user, sid), None)
+                return None
+            cred.last_used = now
+            return cred
+
+    def pop(self, ad_user: str, sid: str) -> bool:
+        with self._lock:
+            return self._store.pop((ad_user, sid), None) is not None
+
+    def list(self, ad_user: str) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        out: list[dict[str, Any]] = []
+        with self._lock:
+            stale = [
+                key for key, c in self._store.items() if self._expired(c, now)
+            ]
+            for key in stale:
+                self._store.pop(key, None)
+            for (user, sid), cred in self._store.items():
+                if user != ad_user:
+                    continue
+                out.append({
+                    "sftp_session_id": sid,
+                    "win_session_id": cred.win_session_id,
+                    "host": cred.host,
+                    "port": cred.port,
+                    "user": cred.user,
+                    "auth_method": cred.auth_method,
+                })
+        return out
 
 
 def _ps_escape(value: str) -> str:
@@ -1000,6 +1084,211 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
             "| Format-Table -AutoSize | Out-String -Width 300"
         )
         return sm.run_ps(session_id, cmd, tool_name="resolve_dns_name")
+
+    # ==================================================================
+    # SFTP — read-only (via Posh-SSH on the remote Windows host)
+    #
+    # Credentials are entered once via sftp_connect and cached in memory with
+    # an idle TTL (keyed per AD user). The read tools then take only an
+    # sftp_session_id. Each call still re-establishes the SFTP connection,
+    # because every run_ps runs in a fresh WinRM shell; the cache only avoids
+    # re-passing the secret, it does not keep the SFTP socket open.
+    # ==================================================================
+
+    sftp_creds = _SftpCredStore(SFTP_CRED_IDLE_TTL_SECONDS)
+
+    def _sftp_exec(cred: _SftpCred, op_block: str, tool_name: str) -> dict[str, Any]:
+        """Open a Posh-SSH SFTP session from cred, run op_block (which uses
+        $s.SessionId), and always tear it down. The secret is redacted."""
+        redactions: list[str] = []
+        if cred.secret:
+            redactions.append(cred.secret)
+            cred_block = (
+                "$sec = ConvertTo-SecureString '" + _ps_escape(cred.secret)
+                + "' -AsPlainText -Force; "
+            )
+        else:
+            cred_block = "$sec = New-Object System.Security.SecureString; "
+        cred_block += (
+            "$cred = New-Object System.Management.Automation.PSCredential('"
+            + _ps_escape(cred.user) + "', $sec); "
+        )
+
+        key_arg = ""
+        if cred.auth_method == "key":
+            key_arg = "-KeyFile '" + _ps_escape(cred.key_path) + "' "
+
+        preamble = (
+            "$ErrorActionPreference='Stop'; "
+            "if (-not (Get-Module -ListAvailable Posh-SSH)) "
+            "{ throw 'Posh-SSH module is not installed on the remote host' }; "
+            "Import-Module Posh-SSH -ErrorAction Stop; "
+            + cred_block +
+            "$s = New-SFTPSession -ComputerName '" + _ps_escape(cred.host) + "' "
+            "-Port " + str(cred.port) + " -Credential $cred " + key_arg +
+            "-AcceptKey -ConnectionTimeout " + str(cred.timeout) + "; "
+        )
+
+        cmd = (
+            "try { " + preamble + op_block + " } "
+            "finally { if ($s) { Remove-SFTPSession -SessionId $s.SessionId "
+            "-ErrorAction SilentlyContinue | Out-Null } }"
+        )
+        return sm.run_ps(
+            cred.win_session_id, cmd, tool_name=tool_name, redactions=redactions
+        )
+
+    def _resolve_sftp(sftp_session_id: str) -> tuple[_SftpCred | None, dict[str, Any] | None]:
+        cred = sftp_creds.get(sm.current_username(), sftp_session_id)
+        if cred is None:
+            return None, {
+                "error": f"Unknown or expired sftp_session_id '{sftp_session_id}'. "
+                "Call sftp_connect first."
+            }
+        return cred, None
+
+    @mcp.tool()
+    def sftp_connect(
+        session_id: Annotated[str, Field(description="WinRM session ID from connect; the SFTP connection is made FROM this Windows host")],
+        sftp_host: Annotated[str, Field(description="Target SFTP server hostname or IP, e.g. 'sftp.example.com'")],
+        sftp_user: Annotated[str, Field(description="SFTP username")],
+        auth_method: Annotated[str, Field(description="'password' (default) or 'key'")] = "password",
+        password: Annotated[str, Field(description="SFTP password, or key passphrase when auth_method='key'; cached in memory and redacted from logs")] = "",
+        key_path: Annotated[str, Field(description="Path to the private key file ON the Windows host; required when auth_method='key'")] = "",
+        sftp_port: Annotated[int, Field(description="SFTP port, default 22")] = 22,
+        timeout_sec: Annotated[int, Field(description="Connection timeout seconds, default 30, capped at 120")] = 30,
+    ) -> dict[str, Any]:
+        """Validate SFTP credentials against a target server (reached FROM the connected Windows host) and cache them in memory, returning an sftp_session_id. Pass that id to sftp_list_directory, sftp_stat, and sftp_read_file so the secret is entered only once. Credentials expire after an idle TTL; call sftp_disconnect when done.
+        """
+        am = auth_method.strip().lower()
+        if am not in ("password", "key"):
+            return {"error": "auth_method must be 'password' or 'key'"}
+        if am == "key" and not key_path.strip():
+            return {"error": "key_path is required when auth_method='key'"}
+        if am == "password" and not password:
+            return {"error": "password is required when auth_method='password'"}
+        if not sftp_host.strip() or not sftp_user.strip():
+            return {"error": "sftp_host and sftp_user are required"}
+
+        cred = _SftpCred(
+            win_session_id=session_id,
+            host=sftp_host.strip(),
+            port=max(1, min(sftp_port, 65535)),
+            user=sftp_user.strip(),
+            auth_method=am,
+            secret=password,
+            key_path=key_path.strip() if am == "key" else "",
+            timeout=max(1, min(timeout_sec, 120)),
+            last_used=time.monotonic(),
+        )
+
+        op = "Get-SFTPLocation -SessionId $s.SessionId | ForEach-Object { \"pwd=$_\" }"
+        result = _sftp_exec(cred, op, "sftp_connect")
+        if "error" in result or result.get("status_code", 1) != 0:
+            return {
+                "status": "error",
+                "error": (result.get("stderr") or result.get("error")
+                          or "SFTP connection failed").strip(),
+            }
+
+        sid = cred.user + "@" + cred.host
+        if cred.port != 22:
+            sid += ":" + str(cred.port)
+        cred.last_used = time.monotonic()
+        sftp_creds.put(sm.current_username(), sid, cred)
+        return {
+            "sftp_session_id": sid,
+            "status": "connected",
+            "host": cred.host,
+            "port": cred.port,
+            "user": cred.user,
+            "auth_method": cred.auth_method,
+            "working_dir": result.get("stdout", "").strip(),
+        }
+
+    @mcp.tool()
+    def sftp_disconnect(
+        sftp_session_id: Annotated[str, Field(description="SFTP session ID returned by sftp_connect")],
+    ) -> dict[str, Any]:
+        """Drop a cached SFTP credential set so its secret leaves server memory; call it when finished with a target. SFTP credentials are not auto-cleaned except by the idle TTL.
+        """
+        if sftp_creds.pop(sm.current_username(), sftp_session_id):
+            return {"sftp_session_id": sftp_session_id, "status": "disconnected"}
+        return {"error": f"Unknown sftp_session_id '{sftp_session_id}'"}
+
+    @mcp.tool()
+    def sftp_list_sessions() -> dict[str, Any]:
+        """List your active (non-expired) SFTP sessions with target host, port, user, and auth method. Use it to find an sftp_session_id. Secrets are never returned.
+        """
+        items = sftp_creds.list(sm.current_username())
+        return {"sftp_sessions": items, "count": len(items)}
+
+    @mcp.tool()
+    def sftp_list_directory(
+        sftp_session_id: Annotated[str, Field(description="SFTP session ID returned by sftp_connect")],
+        remote_path: Annotated[str, Field(description="Remote directory to list, e.g. '/incoming' or '.'")],
+    ) -> dict[str, Any]:
+        """List a directory on a remote SFTP server (via the cached sftp_session_id) as tabular text (Type, Length, Modified, Name; max 300 entries). Read-only: it never modifies the SFTP target.
+        """
+        cred, err = _resolve_sftp(sftp_session_id)
+        if err is not None:
+            return err
+        rp = _ps_escape(remote_path)
+        op = (
+            "Get-SFTPChildItem -SessionId $s.SessionId -Path '" + rp + "' "
+            "| Select-Object -First 300 "
+            "@{N='Type';E={if($_.IsDirectory){'D'}else{'-'}}}, "
+            "@{N='Length';E={$_.Length}}, "
+            "@{N='Modified';E={$_.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')}}, "
+            "@{N='Name';E={$_.Name}} "
+            "| Sort-Object Type, Name | Format-Table -AutoSize | Out-String -Width 300"
+        )
+        return _sftp_exec(cred, op, "sftp_list_directory")
+
+    @mcp.tool()
+    def sftp_stat(
+        sftp_session_id: Annotated[str, Field(description="SFTP session ID returned by sftp_connect")],
+        remote_path: Annotated[str, Field(description="Remote file or directory path to inspect")],
+    ) -> dict[str, Any]:
+        """Return JSON metadata for one path on a remote SFTP server (IsDirectory, IsRegularFile, SizeBytes, Modified) via the cached sftp_session_id. Read-only. Use it to confirm a path exists and check a file's size before reading it.
+        """
+        cred, err = _resolve_sftp(sftp_session_id)
+        if err is not None:
+            return err
+        rp = _ps_escape(remote_path)
+        op = (
+            "$a = Get-SFTPPathAttribute -SessionId $s.SessionId -Path '" + rp + "'; "
+            "[PSCustomObject]@{"
+            "Path='" + rp + "'; "
+            "IsDirectory=$a.IsDirectory; "
+            "IsRegularFile=$a.IsRegularFile; "
+            "SizeBytes=$a.Size; "
+            "Modified=$a.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')"
+            "} | ConvertTo-Json -Compress"
+        )
+        return _sftp_exec(cred, op, "sftp_stat")
+
+    @mcp.tool()
+    def sftp_read_file(
+        sftp_session_id: Annotated[str, Field(description="SFTP session ID returned by sftp_connect")],
+        remote_path: Annotated[str, Field(description="Remote file path to read")],
+        max_lines: Annotated[int, Field(description="Max lines to return, default 200, capped at 500")] = 200,
+    ) -> dict[str, Any]:
+        """Read a remote SFTP text file's contents as numbered lines (max 500) in '     1|line' format via the cached sftp_session_id. Read-only: the file is fetched into memory and never modified on the target. Best for logs and config files; check size with sftp_stat first for large files.
+        """
+        cred, err = _resolve_sftp(sftp_session_id)
+        if err is not None:
+            return err
+        rp = _ps_escape(remote_path)
+        cap = max(1, min(max_lines, 500))
+        op = (
+            "$c = Get-SFTPContent -SessionId $s.SessionId -Path '" + rp + "'; "
+            "if ($c -is [byte[]]) { $c = [System.Text.Encoding]::UTF8.GetString($c) }; "
+            "$lines = @(($c -split '\\r?\\n') | Select-Object -First " + str(cap) + "); "
+            "$n = 1; $lines | ForEach-Object { '{0,6}|{1}' -f ($n++), $_ }; "
+            "Write-Output (\"--- read $($lines.Count) lines ---\")"
+        )
+        return _sftp_exec(cred, op, "sftp_read_file")
 
     # ==================================================================
     # Write operations (all require user confirmation via elicitation)

@@ -231,8 +231,19 @@ class SessionManager:
             return {"sessions": items, "count": len(items)}
 
     def run_ps(
-        self, session_id: str, command: str, tool_name: str = ""
+        self,
+        session_id: str,
+        command: str,
+        tool_name: str = "",
+        redactions: list[str] | None = None,
     ) -> dict[str, Any]:
+        def _redact(text: str) -> str:
+            if redactions:
+                for secret in redactions:
+                    if secret:
+                        text = text.replace(secret, "***")
+            return text
+
         with self._lock:
             s = self._sessions.get(session_id)
             if not s:
@@ -253,9 +264,9 @@ class SessionManager:
 
                 stdout = result.std_out.decode("utf-8", errors="replace")
                 raw_stderr = result.std_err.decode("utf-8", errors="replace")
-                stderr = _strip_clixml(raw_stderr)
+                stderr = _redact(_strip_clixml(raw_stderr))
 
-                truncated_stdout = _truncate(stdout)
+                truncated_stdout = _redact(_truncate(stdout))
 
                 _audit_block(
                     f"COMMAND #{cmd_num}{label}",
@@ -269,7 +280,7 @@ class SessionManager:
                         "stderr_bytes": str(len(stderr)),
                     },
                     body=(
-                        "  PS> " + command + "\n"
+                        "  PS> " + _redact(command) + "\n"
                         "\n"
                         "  ── stdout ──\n"
                         + _indent(truncated_stdout)
@@ -288,14 +299,14 @@ class SessionManager:
                     "elapsed_ms": elapsed_ms,
                 }
             except Exception as e:
-                logger.error("run_ps failed on %s: %s", session_id, e)
+                logger.error("run_ps failed on %s: %s", session_id, _redact(str(e)))
                 _audit_block(f"COMMAND ERROR{label}", {
                     "user": self._username,
                     "session": session_id,
                     "tool": tool_name or "(direct)",
-                    "error": str(e)[:300],
-                }, body="  PS> " + command)
-                return {"error": str(e), "session_id": session_id}
+                    "error": _redact(str(e))[:300],
+                }, body="  PS> " + _redact(command))
+                return {"error": _redact(str(e)), "session_id": session_id}
 
 
 def _indent(text: str, prefix: str = "  ") -> str:
@@ -448,6 +459,10 @@ class SessionRegistry:
         return self._get().list_sessions()
 
     def run_ps(
-        self, session_id: str, command: str, tool_name: str = ""
+        self,
+        session_id: str,
+        command: str,
+        tool_name: str = "",
+        redactions: list[str] | None = None,
     ) -> dict[str, Any]:
-        return self._get().run_ps(session_id, command, tool_name)
+        return self._get().run_ps(session_id, command, tool_name, redactions)
