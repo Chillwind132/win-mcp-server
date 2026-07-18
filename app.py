@@ -27,19 +27,16 @@ AD_PASSWORD_IDLE_TTL_SECONDS = int(
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    """Extract per-user AD username from headers.
+    """Extract per-user AD credentials from headers.
 
-    Passwords are collected later through MCP elicitation and kept only in
-    the in-memory SessionRegistry cache.
+    X-AD-User is required.
+    X-AD-Password is optional: when supplied it authenticates the caller with
+    no prompts; when omitted the password is collected through MCP elicitation.
+    The password is kept only in the in-memory SessionRegistry cache and is
+    never logged.
     """
 
     async def dispatch(self, request: Request, call_next):  # type: ignore[override]
-        if request.headers.get("x-ad-password") is not None:
-            return JSONResponse(
-                {"error": "X-AD-Password header is not accepted"},
-                status_code=400,
-            )
-
         username = request.headers.get("x-ad-user", "").strip()
 
         if not username:
@@ -48,7 +45,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 status_code=401,
             )
 
-        token = current_user.set(UserIdentity(username=username))
+        password = request.headers.get("x-ad-password", "")
+
+        token = current_user.set(UserIdentity(username=username, password=password))
         try:
             return await call_next(request)
         finally:
