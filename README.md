@@ -4,11 +4,102 @@
 [![Python 3.11](https://img.shields.io/badge/python-3.11-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](Dockerfile)
 
-Remote Windows operations via WinRM/NTLM, exposed as an MCP (Model Context Protocol) server. Connects to any AD-joined Windows host using per-user credentials elicited at runtime — passwords live only in server memory with an idle TTL and are never logged.
+**A Windows MCP server for remote administration over WinRM/NTLM.** Diagnose, inspect, and manage any AD-joined Windows host from Cursor, Claude Code, Codex, or any MCP (Model Context Protocol) client. Connects using per-user credentials elicited at runtime. Passwords live only in server memory with an idle TTL and are never logged.
 
-- **40+ tools** — filesystem, services, registry, event logs, certificates, processes, network, scheduled tasks, and more
-- **Per-user AD identity** — each request carries an `X-AD-User` header; the password is either supplied via the optional `X-AD-Password` header (no prompt) or elicited once and cached in-memory
-- **Zero secrets on disk** — no credentials in config files, env vars, or logs
+- **40+ tools**: filesystem, services, registry, event logs, certificates, processes, network, scheduled tasks, and more
+- **Per-user AD identity**: each request carries an `X-AD-User` header; the password is either supplied via the optional `X-AD-Password` header (no prompt) or elicited once and cached in-memory
+- **Zero secrets on disk**: no credentials in config files, env vars, or logs
+
+## Example prompts
+
+- "Why is drive C: almost full on `HOST1`?"
+- "Check the event log for errors in the last 24 hours."
+- "The Print Spooler service stopped, find out why and restart it."
+- "Which process is using port 443?"
+- "List certificates expiring in the next 30 days."
+- "Read `HKLM:\SOFTWARE\MyApp` and show me the current settings."
+- "Compare `web.config` between the two app servers."
+
+## Tools
+
+### Session
+
+| Tool | Description |
+|------|-------------|
+| `connect` | Open a WinRM session to a Windows host and return a `session_id` |
+| `disconnect` | Close an active WinRM session |
+| `list_sessions` | List active WinRM sessions with usage details |
+
+### Filesystem (read-only)
+
+| Tool | Description |
+|------|-------------|
+| `list_directory` | List files and directories at a path |
+| `find_files` | Recursively find files by wildcard pattern |
+| `read_file` | Read file contents as numbered lines |
+| `search_file_content` | Grep-like text search in a file or across a directory |
+| `file_info` | JSON metadata for a file or directory |
+| `compare_files` | Line-by-line diff of two files |
+
+### System diagnostics (read-only)
+
+| Tool | Description |
+|------|-------------|
+| `get_event_log` | Windows Event Log: crashes, service failures, auth errors |
+| `get_services` | Services summary or full JSON detail per service |
+| `list_processes` | Processes sorted by CPU, memory, or handles |
+| `get_system_info` | OS version, uptime, RAM, CPU count, domain, timezone |
+| `get_disk_space` | Disk space for all fixed drives |
+| `get_perf_snapshot` | Averaged CPU, memory, disk I/O, network snapshot |
+| `get_registry` | Read a registry key or value (read-only) |
+| `get_certificates` | Personal store certificates sorted by days until expiry |
+| `get_network_config` | Per-NIC IP, gateway, and DNS configuration |
+| `test_network` | ICMP ping or TCP port test from the remote host |
+
+### Identity & configuration (read-only)
+
+| Tool | Description |
+|------|-------------|
+| `get_environment_variables` | Environment variables by scope |
+| `get_scheduled_tasks` | Scheduled tasks with last/next run and result |
+| `get_local_users` | Local user accounts with status and last logon |
+| `get_user_groups` | Local group memberships |
+| `get_security_context` | Current session identity, groups, privileges (`whoami /all`) |
+| `get_permissions` | File/folder ACL entries |
+
+### Network & software (read-only)
+
+| Tool | Description |
+|------|-------------|
+| `get_tcp_connections` | Active TCP connections with owning process |
+| `get_dns_cache` | Local DNS client cache |
+| `get_installed_software` | Installed software from 64-bit and 32-bit uninstall keys |
+| `resolve_dns_name` | DNS resolution chain from the remote server |
+
+### SFTP (read-only, from the Windows host)
+
+| Tool | Description |
+|------|-------------|
+| `sftp_connect` | Validate and cache SFTP credentials, returning an `sftp_session_id` |
+| `sftp_disconnect` | Drop a cached SFTP credential set |
+| `sftp_list_sessions` | List active SFTP sessions |
+| `sftp_list_directory` | List a directory on a remote SFTP server |
+| `sftp_stat` | JSON metadata for one remote path |
+| `sftp_read_file` | Read a remote text file as numbered lines |
+
+### Write operations (all require user confirmation)
+
+| Tool | Description |
+|------|-------------|
+| `restart_service` / `stop_service` / `start_service` | Manage services with before/after state |
+| `kill_process` | Force-terminate a process by PID |
+| `set_registry` | Set a registry value showing old vs new |
+| `copy_file` / `rename_file` / `move_file` | File operations (no overwrite unless requested) |
+| `create_directory` | Create a directory and missing parents |
+| `delete_file` / `delete_directory` | Delete with metadata/size shown in the prompt |
+| `compress_archive` / `expand_archive` | Create or extract `.zip` archives |
+| `flush_dns` | Clear the DNS client cache |
+| `invoke_http_request` | HTTP request from the remote server |
 
 ## Quick Start
 
@@ -16,7 +107,11 @@ Remote Windows operations via WinRM/NTLM, exposed as an MCP (Model Context Proto
 docker compose -f docker-compose.yml -p win-mcp up -d --build --force-recreate
 ```
 
-## Cursor `mcp.json`
+## Client setup
+
+`X-AD-User` is required. `X-AD-Password` is optional: omit it and the server prompts for the password once via MCP elicitation, caching it in memory.
+
+### Cursor (`mcp.json`)
 
 ```json
 {
@@ -32,3 +127,21 @@ docker compose -f docker-compose.yml -p win-mcp up -d --build --force-recreate
   }
 }
 ```
+
+### Claude Code
+
+```bash
+claude mcp add --transport http win-mcp http://localhost:8005/mcp \
+  --header "X-AD-User: <your-ad-username>" \
+  --header "X-AD-Password: <your-ad-password>"
+```
+
+### Codex (`~/.codex/config.toml`)
+
+```toml
+[mcp_servers.win-mcp]
+url = "http://localhost:8005/mcp"
+http_headers = { "X-AD-User" = "<your-ad-username>", "X-AD-Password" = "<your-ad-password>" }
+```
+
+Any other MCP client works the same way: point it at the streamable HTTP endpoint and pass the headers.
