@@ -178,11 +178,12 @@ def register_tools(mcp: FastMCP, sm: SessionRegistry) -> None:
         session_id: Annotated[str, Field(description="Session ID returned by connect")],
         path: Annotated[str, Field(description="Absolute directory path to list, e.g. 'C:\\Users' or 'D:\\Logs'")],
     ) -> dict[str, Any]:
-        """List files and directories at a path as tabular text (Mode, LastWriteTime, Length, Name; max 200 entries). Use this to explore one folder; use find_files to search recursively by pattern instead.
+        """List files and directories at a path as tabular text (Mode, LastWriteTime, Length, Name; max 200 entries, most recently modified first). Use this to explore one folder; use find_files to search recursively by pattern instead.
         """
         safe = _ps_escape(path)
         cmd = (
             "Get-ChildItem -LiteralPath '" + safe + "' -Force -ErrorAction Stop "
+            "| Sort-Object LastWriteTime -Descending "
             "| Select-Object -First 200 Mode, LastWriteTime, Length, Name "
             "| Format-Table -AutoSize | Out-String -Width 300"
         )
